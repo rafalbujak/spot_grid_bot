@@ -1,3 +1,4 @@
+use rusqlite::params;
 use hmac::Mac;
 use hmac::KeyInit;
 use dotenvy::dotenv;
@@ -11,7 +12,9 @@ use sha2::Sha256;
 
 use crate::utils::{adjust_quantity, load_config};
 use crate::database::{save_orders_to_db, display_orders};
-const TRADING_FEE_RATE: f64 = 0.001; // 0.1% standardowa opłata Binance
+const TRADING_FEE_RATE: f64 = 0.015; // 0.1% standardowa opłata Binance
+
+
 
 /// Składa zlecenie kupna lub sprzedaży na Binance
 pub(crate) async fn place_binance_order(
@@ -21,10 +24,14 @@ pub(crate) async fn place_binance_order(
     symbol: &str,
     side: &str,
     price: f64,
-    quantity: f64
+    quantity: f64,
+    is_initial_buy: bool
 ) -> Result<u64, String> {
     let timestamp = get_binance_server_time().await.unwrap_or(0);
     let mut adjusted_quantity = quantity;
+
+    // 📌 Pobieramy poprawny symbol bazowy (np. "LTC" z "LTCUSDC")
+    let base_asset = extract_base_asset(symbol);
 
     // ⚠️ Uwzględnienie opłat Binance przy sprzedaży
     if side == "SELL" {
@@ -45,8 +52,9 @@ pub(crate) async fn place_binance_order(
 
     // 🔄 Sprawdzenie dostępnego balansu przed sprzedażą
     if side == "SELL" {
-        let base_asset = symbol.chars().take_while(|&c| c.is_alphabetic()).collect::<String>(); // np. "LTC" z "LTCUSDC"
         let available_balance = get_available_balance(&base_asset, api_key, secret_key).await.unwrap_or(0.0);
+
+        println!("💰 {} balance for selling: {:.5}", base_asset, available_balance);
 
         if available_balance < adjusted_quantity {
             println!(
@@ -57,10 +65,17 @@ pub(crate) async fn place_binance_order(
         }
     }
 
-    let query_string = format!(
-        "symbol={}&side={}&type=LIMIT&timeInForce=GTC&quantity={:.6}&price={:.2}&timestamp={}",
-        symbol, side, adjusted_quantity, price, timestamp
-    );
+    let query_string = if is_initial_buy {
+        format!(
+            "symbol={}&side={}&type=MARKET&quantity={:.6}&timestamp={}",
+            symbol, side, adjusted_quantity, timestamp
+        )
+    } else {
+        format!(
+            "symbol={}&side={}&type=LIMIT&timeInForce=GTC&quantity={:.6}&price={:.2}&timestamp={}",
+            symbol, side, adjusted_quantity, price, timestamp
+        )
+    };
 
     let signature = generate_signature(&query_string, secret_key);
     let url = format!(
@@ -98,9 +113,37 @@ pub(crate) async fn place_binance_order(
     }
 }
 
-async fn get_available_balance(asset: &str, api_key: &str, secret_key: &str) -> Result<f64, String> {
+/// Pobiera symbol bazowy z pary handlowej (np. "LTC" z "LTCUSDC")
+/// Pobiera symbol bazowy z pary handlowej (np. "LTC" z "LTCUSDC")
+/// Pobiera symbol bazowy z pary handlowej (np. "LTC" z "LTCUSDC")
+pub(crate) fn extract_base_asset(symbol: &str) -> String {
+    let quote_assets = ["USDT", "BTC", "ETH", "BNB", "BUSD", "DAI", "TUSD", "USDC"];
+
+    for quote in quote_assets.iter() {
+        if symbol.ends_with(quote) {
+            let base_asset = symbol.strip_suffix(quote).unwrap_or(symbol);
+            println!("🔍 Extracted base asset from '{}': '{}'", symbol, base_asset); // Debugowanie
+            return base_asset.to_string();
+        }
+    }
+
+    println!("⚠️ Could not extract base asset, returning original: '{}'", symbol);
+    symbol.to_string()
+}
+
+
+pub(crate) async fn get_available_balance(asset: &str, api_key: &str, secret_key: &str) -> Result<f64, String> {
     let client = Client::new();
-    let timestamp = get_binance_server_time().await.unwrap_or(0);
+
+    // 🔍 Pobieramy timestamp z Binance (sprawdzamy poprawność)
+    let timestamp = match get_binance_server_time().await {
+        Ok(time) => time,
+        Err(e) => {
+            println!("❌ Failed to get Binance server time: {}", e);
+            return Err("Failed to sync timestamp".to_string());
+        }
+    };
+
     let query_string = format!("timestamp={}", timestamp);
     let signature = generate_signature(&query_string, secret_key);
 
@@ -118,20 +161,47 @@ async fn get_available_balance(asset: &str, api_key: &str, secret_key: &str) -> 
     match response {
         Ok(resp) if resp.status().is_success() => {
             let json_resp: Value = resp.json().await.unwrap();
+
+            // 🔍 Debugowanie: Wypisz całą odpowiedź API (usuń po testach)
+            println!("🔍 Binance API Response: {:?}", json_resp);
+
             if let Some(balances) = json_resp["balances"].as_array() {
                 for balance in balances {
-                    if balance["asset"] == asset {
-                        let free_balance = balance["free"].as_str().unwrap_or("0.0").parse::<f64>().unwrap_or(0.0);
+                    let balance_asset = balance["asset"].as_str().unwrap_or("");
+
+                    // 📌 Debugowanie porównania nazw aktywów
+                    println!("🔍 Comparing asset: {} with expected: {}", balance_asset, asset);
+
+                    if balance_asset == asset {
+                        let free_balance = balance["free"]
+                            .as_str()
+                            .unwrap_or("0.0")
+                            .parse::<f64>()
+                            .unwrap_or_else(|_| {
+                                println!("❌ Error parsing balance for {}!", asset);
+                                0.0
+                            });
+
+                        println!("✅ Available balance for {}: {:.5}", asset, free_balance);
+
                         return Ok(free_balance);
                     }
                 }
             }
-            Err("Asset not found in balance.".to_string())
+            Err(format!("❌ Asset {} not found in balance.", asset))
         }
-        Ok(resp) => Err(resp.text().await.unwrap_or_else(|_| "Unknown error".to_string())),
-        Err(e) => Err(e.to_string()),
+        Ok(resp) => {
+            let error_msg = resp.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            println!("❌ Binance API Error: {}", error_msg);
+            Err(error_msg)
+        }
+        Err(e) => {
+            println!("❌ Request error: {}", e);
+            Err(e.to_string())
+        }
     }
 }
+
 
 /// Funkcja do generowania sygnatury HMAC-SHA256 dla API Binance
 pub(crate) fn generate_signature(query: &str, secret_key: &str) -> String {
@@ -217,12 +287,22 @@ pub(crate) async fn show_binance_orders(db: &mut Connection) {
 }
 
 ///  synchrnizacja czasu
-pub(crate) async fn get_binance_server_time() -> Result<u128, reqwest::Error> {
+pub async fn get_binance_server_time() -> Result<u64, String> {
     let client = reqwest::Client::new();
     let url = "https://api.binance.com/api/v3/time";
-    let response = client.get(url).send().await?.json::<serde_json::Value>().await?;
-    Ok(response["serverTime"].as_u64().unwrap_or(0) as u128)
+
+    let response = client.get(url).send().await;
+
+    match response {
+        Ok(resp) if resp.status().is_success() => {
+            let json_resp: serde_json::Value = resp.json().await.unwrap();
+            Ok(json_resp["serverTime"].as_u64().unwrap_or(0))
+        }
+        Ok(resp) => Err(resp.text().await.unwrap_or_else(|_| "Unknown error".to_string())),
+        Err(e) => Err(e.to_string()),
+    }
 }
+
 
 
 
@@ -301,17 +381,15 @@ async fn get_account_balance(asset: &str, api_key: &str, secret_key: &str) -> Re
 }
 
 pub(crate) async fn get_filled_sell_orders(db: &mut Connection) -> Vec<(String, f64, f64)> {
-    dotenv().ok();
-    let config = load_config("config.txt");
-    let api_key = config.get("BINANCE_API_KEY").expect("Missing API key");
-    let secret_key = config.get("BINANCE_SECRET_KEY").expect("Missing secret key");
-    let client = reqwest::Client::new();
+    let api_key = load_config("config.txt").get("BINANCE_API_KEY").unwrap().clone();
+    let secret_key = load_config("config.txt").get("BINANCE_SECRET_KEY").unwrap().clone();
+    let client = Client::new();
 
     let timestamp = get_binance_server_time().await.unwrap_or(0);
     let query_string = format!("timestamp={}", timestamp);
     let signature = generate_signature(&query_string, &secret_key);
 
-    let url = format!("https://api.binance.com/api/v3/openOrders?{}&signature={}", query_string, signature);
+    let url = format!("https://api.binance.com/api/v3/allOrders?{}&signature={}", query_string, signature);
 
     let mut headers = HeaderMap::new();
     headers.insert("X-MBX-APIKEY", HeaderValue::from_str(&api_key).unwrap());
@@ -322,31 +400,37 @@ pub(crate) async fn get_filled_sell_orders(db: &mut Connection) -> Vec<(String, 
     match response {
         Ok(resp) if resp.status().is_success() => {
             let orders: serde_json::Value = resp.json().await.unwrap();
-            let mut filled_sell_orders = Vec::new();
+            let mut filled_orders = Vec::new();
 
             if let Some(order_list) = orders.as_array() {
                 for order in order_list {
-                    let status = order["status"].as_str().unwrap_or("UNKNOWN");
-                    let order_type = order["side"].as_str().unwrap_or("UNKNOWN");
-                    let symbol = order["symbol"].as_str().unwrap_or("UNKNOWN").to_string();
-                    let price = order["price"].as_str().unwrap_or("0.0").parse::<f64>().unwrap_or(0.0);
-                    let quantity = order["origQty"].as_str().unwrap_or("0.0").parse::<f64>().unwrap_or(0.0);
+                    if order["status"] == "FILLED" && order["side"] == "SELL" {
+                        let symbol = order["symbol"].as_str().unwrap_or("UNKNOWN").to_string();
+                        let price = order["price"].as_str().unwrap_or("0.0").parse::<f64>().unwrap_or(0.0);
+                        let quantity = order["executedQty"].as_str().unwrap_or("0.0").parse::<f64>().unwrap_or(0.0);
 
-                    if status == "FILLED" && order_type == "SELL" {
-                        filled_sell_orders.push((symbol, price, quantity));
+                        // 🟢 Sprawdzamy, czy to zlecenie nie zostało już przetworzone
+                        let exists: bool = db.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM trades WHERE order_id = ?1)",
+                            params![order["orderId"].as_u64().unwrap_or(0)],
+                            |row| row.get(0)
+                        ).unwrap_or(false);
+
+                        if !exists {
+                            filled_orders.push((symbol, price, quantity));
+                        }
                     }
                 }
             }
-
-            return filled_sell_orders;
+            return filled_orders;
         }
         Ok(resp) => {
-            println!("Failed to fetch orders: {}", resp.text().await.unwrap());
+            println!("❌ Failed to fetch orders: {}", resp.text().await.unwrap());
         }
         Err(e) => {
-            println!("Request error: {}", e);
+            println!("❌ Request error: {}", e);
         }
     }
-
     Vec::new()
 }
+
